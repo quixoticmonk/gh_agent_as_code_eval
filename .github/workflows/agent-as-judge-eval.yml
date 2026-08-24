@@ -31,6 +31,7 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       EXPERIMENT_NAME: agent-as-judge-python-eval-${{ github.event.repository.name }}-pr-${{ github.event.pull_request.number }}
       PYTHON_STYLE_GUIDE_PATH: ${{ vars.PYTHON_STYLE_GUIDE_PATH || '.github/etk/requirements/python-style-guide.md' }}
+      GENAI_ETK_CLI_S3_KEY: ${{ vars.GENAI_ETK_CLI_S3_KEY || 'cli/awssolutions-gen-ai-evaluation-toolkit-cli-2.0.1.tgz' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,20 +59,19 @@ jobs:
           echo "GEN_AI_ETK_API_URL=${API_URL}" >> "$GITHUB_ENV"
           : "${ETK_RESULTS_BUCKET:?ETK_RESULTS_BUCKET repo variable must be set}"
 
-      # --- Stage 3: install the genai-etk CLI (placeholder) ----------------------
+      # --- Stage 3: install the genai-etk CLI -------------------------------------
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install genai-etk CLI
         run: |
           set -euo pipefail
-          echo "TODO: replace with the real genai-etk CLI install/download step, e.g.:"
-          echo "  curl -fsSL \"\$GENAI_ETK_CLI_DOWNLOAD_URL\" -o genai-etk.tgz && npm install -g ./genai-etk.tgz"
-          mkdir -p "$HOME/.local/bin"
-          cat > "$HOME/.local/bin/genai-etk" <<'EOF'
-          #!/usr/bin/env bash
-          echo "genai-etk placeholder binary -- replace the 'Install genai-etk CLI' step with a real install" >&2
-          exit 1
-          EOF
-          chmod +x "$HOME/.local/bin/genai-etk"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          aws s3 cp "s3://${ETK_RESULTS_BUCKET}/${GENAI_ETK_CLI_S3_KEY}" genai-etk-cli.tgz
+          npm install -g ./genai-etk-cli.tgz
+          genai-etk --help >/dev/null
+          echo "genai-etk CLI installed: $(genai-etk -v 2>/dev/null || echo unknown)"
 
       # --- Stage 4: upload PR diff + style guide to S3 ---------------------------
       - name: Compute PR diff
