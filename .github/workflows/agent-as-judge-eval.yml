@@ -210,7 +210,12 @@ jobs:
             fi
             echo
             if [ -f results.json ]; then
-              echo '<details><summary>Per-test-case results</summary>'
+              CFG_FILE="scorer-config.json"
+              [ -f "$CFG_FILE" ] || CFG_FILE=<(echo '{}')
+              jq -r --slurpfile cfg "$CFG_FILE" -f .github/etk/format-results.jq results.json
+
+              echo
+              echo '<details><summary>Raw per-test-case results (JSON)</summary>'
               echo
               echo '```json'
               jq . results.json
