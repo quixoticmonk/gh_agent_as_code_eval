@@ -1,0 +1,229 @@
+name: agent-as-judge-eval
+
+# Runs the genai-ETK "agent-as-judge" evaluator against each PR's diff and posts the verdict
+# as a PR comment. See .github/etk/README.md for one-time repo setup (secrets/variables).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      - ".github/**"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write # required to assume the IAM role via OIDC
+  contents: read
+  pull-requests: write # required to post the results comment
+
+concurrency:
+  group: agent-as-judge-eval-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ETK_PROJECT_NAME: ${{ vars.ETK_PROJECT_NAME || 'etk' }}
+      ETK_RESULTS_BUCKET: ${{ vars.ETK_RESULTS_BUCKET }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      EXPERIMENT_NAME: agent-as-judge-python-eval-${{ github.event.repository.name }}-pr-${{ github.event.pull_request.number }}
+      PYTHON_STYLE_GUIDE_PATH: ${{ vars.PYTHON_STYLE_GUIDE_PATH || '.github/etk/requirements/python-style-guide.md' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need base + head commits to diff
+
+      # --- Stage 1: authenticate ------------------------------------------------
+      - name: Assume IAM role for session credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ETK_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gh-agent-as-judge-eval-${{ github.run_id }}
+
+      # --- Stage 2: genai-etk CLI environment ------------------------------------
+      - name: Configure genai-etk CLI environment
+        run: |
+          set -euo pipefail
+          if [ -n "${{ vars.GEN_AI_ETK_API_URL }}" ]; then
+            API_URL="${{ vars.GEN_AI_ETK_API_URL }}"
+          else
+            echo "GEN_AI_ETK_API_URL not set as a repo variable; resolving from SSM (/genai-${ETK_PROJECT_NAME}/restApiEndpoint)"
+            API_URL="$(aws ssm get-parameter --name "/genai-${ETK_PROJECT_NAME}/restApiEndpoint" --query 'Parameter.Value' --output text)"
+          fi
+          echo "GEN_AI_ETK_API_URL=${API_URL}" >> "$GITHUB_ENV"
+          : "${ETK_RESULTS_BUCKET:?ETK_RESULTS_BUCKET repo variable must be set}"
+
+      # --- Stage 3: install the genai-etk CLI (placeholder) ----------------------
+      - name: Install genai-etk CLI
+        run: |
+          set -euo pipefail
+          echo "TODO: replace with the real genai-etk CLI install/download step, e.g.:"
+          echo "  curl -fsSL \"\$GENAI_ETK_CLI_DOWNLOAD_URL\" -o genai-etk.tgz && npm install -g ./genai-etk.tgz"
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/genai-etk" <<'EOF'
+          #!/usr/bin/env bash
+          echo "genai-etk placeholder binary -- replace the 'Install genai-etk CLI' step with a real install" >&2
+          exit 1
+          EOF
+          chmod +x "$HOME/.local/bin/genai-etk"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # --- Stage 4: upload PR diff + style guide to S3 ---------------------------
+      - name: Compute PR diff
+        run: |
+          set -euo pipefail
+          git diff --unified=3 \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            > diff.patch
+          echo "Diff: $(wc -l < diff.patch) lines"
+
+      - name: Upload diff and requirement doc to S3
+        run: |
+          set -euo pipefail
+          DIFF_PREFIX="evaluation/agent-as-judge/${REPO_NAME}/pr-${PR_NUMBER}/artifacts/diff/"
+          REQ_PREFIX="evaluation/agent-as-judge/${REPO_NAME}/requirements/"
+
+          aws s3 cp diff.patch "s3://${ETK_RESULTS_BUCKET}/${DIFF_PREFIX}diff.patch"
+          aws s3 cp "${PYTHON_STYLE_GUIDE_PATH}" "s3://${ETK_RESULTS_BUCKET}/${REQ_PREFIX}python-style-guide.md"
+
+          echo "DIFF_PREFIX=${DIFF_PREFIX}" >> "$GITHUB_ENV"
+          echo "REQ_PREFIX=${REQ_PREFIX}" >> "$GITHUB_ENV"
+
+      # --- Stage 5: build the scorer/test-case configs for this PR ---------------
+      - name: Build scorer-config.json and test-cases.json
+        run: |
+          set -euo pipefail
+          CENTRAL_URI="${{ vars.ETK_CONFIG_TEMPLATE_S3_URI }}"
+          if [ -n "$CENTRAL_URI" ]; then
+            echo "Downloading base scorer/test-case templates from ${CENTRAL_URI}"
+            aws s3 cp "${CENTRAL_URI%/}/scorer-config.json" scorer-config.base.json
+            aws s3 cp "${CENTRAL_URI%/}/test-cases.json" test-cases.base.json
+          else
+            echo "ETK_CONFIG_TEMPLATE_S3_URI not set; using in-repo template under .github/etk/"
+            cp .github/etk/scorer-config.json scorer-config.base.json
+            cp .github/etk/test-cases.json test-cases.base.json
+          fi
+
+          jq --arg bucket "$ETK_RESULTS_BUCKET" --arg prefix "$REQ_PREFIX" \
+            '(.agent_as_judge.scores[].requirementDocs[]?.bucketName) = $bucket
+             | (.agent_as_judge.scores[].requirementDocs[]?.prefix) = $prefix' \
+            scorer-config.base.json > scorer-config.json
+
+          jq --arg bucket "$ETK_RESULTS_BUCKET" \
+             --arg prefix "$DIFF_PREFIX" \
+             --arg repo "$REPO_NAME" \
+             --arg pr "$PR_NUMBER" \
+             --arg sha "${{ github.event.pull_request.head.sha }}" \
+            '.[0].context.artifacts[0].bucketName = $bucket
+             | .[0].context.artifacts[0].prefix = $prefix
+             | .[0].input = ("PR #" + $pr + " diff review for " + $repo)
+             | .[0].output = ""
+             | .[0].context.metadata = {repo: $repo, prNumber: $pr, commitSha: $sha}' \
+            test-cases.base.json > test-cases.json
+
+          echo "--- scorer-config.json ---"; cat scorer-config.json
+          echo "--- test-cases.json ---"; cat test-cases.json
+
+      # --- Stage 6: create the MLflow experiment ---------------------------------
+      - name: Create MLflow experiment
+        run: |
+          set -euo pipefail
+          if genai-etk experiment get --name "$EXPERIMENT_NAME" --output json >/dev/null 2>&1; then
+            echo "Experiment ${EXPERIMENT_NAME} already exists, reusing it"
+          else
+            genai-etk experiment create --name "$EXPERIMENT_NAME" \
+              --description "agent-as-judge Python review for ${REPO_NAME} PR #${PR_NUMBER}"
+          fi
+
+      # --- Stage 7: submit and poll the scoring job -------------------------------
+      - name: Submit scoring job
+        run: |
+          set -euo pipefail
+          JOB_ID=$(genai-etk eval job submit-scoring \
+            --evaluator-name "agent-as-judge" \
+            --scorers-json "$(cat scorer-config.json)" \
+            --test-results-json "$(cat test-cases.json)" \
+            --experiment-name "$EXPERIMENT_NAME" \
+            --output json | jq -r '.jobId')
+          if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
+            echo "Failed to obtain jobId from submit-scoring response" >&2
+            exit 1
+          fi
+          echo "JOB_ID=${JOB_ID}" >> "$GITHUB_ENV"
+          echo "Submitted job ${JOB_ID}"
+
+      - name: Poll evaluation job
+        run: |
+          set -euo pipefail
+          MAX_ATTEMPTS=40 # ~20 minutes at 30s intervals
+          STATUS="PENDING"
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            RESPONSE=$(genai-etk eval job get --job-id "$JOB_ID" --output json)
+            STATUS=$(echo "$RESPONSE" | jq -r '.status')
+            echo "Attempt ${attempt}/${MAX_ATTEMPTS}: status=${STATUS}"
+            case "$STATUS" in
+              SUCCESS)
+                echo "REPORT_ID=$(echo "$RESPONSE" | jq -r '.reportId')" >> "$GITHUB_ENV"
+                break
+                ;;
+              FAILURE | PARTIAL_FAILURE)
+                break
+                ;;
+              *)
+                sleep 30
+                ;;
+            esac
+          done
+          if [ "$STATUS" != "SUCCESS" ] && [ "$STATUS" != "FAILURE" ] && [ "$STATUS" != "PARTIAL_FAILURE" ]; then
+            STATUS="TIMEOUT"
+          fi
+          echo "JOB_STATUS=${STATUS}" >> "$GITHUB_ENV"
+
+      - name: Fetch results
+        if: always() && env.REPORT_ID != ''
+        run: |
+          set -euo pipefail
+          genai-etk eval result list --report-id "$REPORT_ID" --output json > results.json
+          cat results.json
+
+      # --- Stage 8: write results back to the PR ----------------------------------
+      - name: Post results to PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "<!-- agent-as-judge-eval:${REPO_NAME}:${PR_NUMBER} -->"
+            echo "### agent-as-judge evaluation — \`${EXPERIMENT_NAME}\`"
+            echo
+            echo "- Job ID: \`${JOB_ID:-n/a}\`"
+            echo "- Status: **${JOB_STATUS:-UNKNOWN}**"
+            if [ -n "${REPORT_ID:-}" ]; then
+              echo "- Report ID: \`${REPORT_ID}\`"
+            fi
+            echo
+            if [ -f results.json ]; then
+              echo '<details><summary>Per-test-case results</summary>'
+              echo
+              echo '```json'
+              jq . results.json
+              echo '```'
+              echo '</details>'
+            fi
+          } > pr-comment.md
+
+          gh pr comment "$PR_NUMBER" --body-file pr-comment.md --edit-last \
+            || gh pr comment "$PR_NUMBER" --body-file pr-comment.md
+
+      - name: Fail on evaluation failure
+        if: env.JOB_STATUS == 'FAILURE' || env.JOB_STATUS == 'PARTIAL_FAILURE' || env.JOB_STATUS == 'TIMEOUT'
+        run: |
+          echo "Evaluation ended with status ${JOB_STATUS}" >&2
+          exit 1

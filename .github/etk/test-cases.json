@@ -1,0 +1,16 @@
+[
+  {
+    "input": "REPLACE_INPUT_LABEL",
+    "output": "",
+    "context": {
+      "artifacts": [
+        { "bucketName": "REPLACE_BUCKET", "prefix": "REPLACE_DIFF_PREFIX" }
+      ],
+      "metadata": {
+        "repo": "REPLACE_REPO",
+        "prNumber": "REPLACE_PR",
+        "commitSha": "REPLACE_SHA"
+      }
+    }
+  }
+]

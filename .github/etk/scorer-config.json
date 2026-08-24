@@ -1,0 +1,19 @@
+{
+  "agent_as_judge": {
+    "scores": {
+      "code_quality": {
+        "description": "Evaluate the submitted Python diff against the provided coding standard.\n\nScore 1.0 if the submission fully satisfies every requirement in the standard.\nDeduct proportionally for each unmet or partially met requirement.\nScore 0.0 if the diff is empty, not valid Python, or completely unreadable.",
+        "config": {
+          "minimumPassingScore": 0.7
+        },
+        "requirementDocs": [
+          { "bucketName": "REPLACE_BUCKET", "prefix": "REPLACE_REQ_PREFIX" }
+        ]
+      }
+    },
+    "params": {
+      "agentModel": "global.anthropic.claude-sonnet-4-6",
+      "agentTemperature": 0.1
+    }
+  }
+}
